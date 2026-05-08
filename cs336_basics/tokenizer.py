@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import multiprocessing as mp
+import os
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator
 from functools import lru_cache
@@ -8,9 +10,16 @@ from os import PathLike
 from pathlib import Path
 
 import regex as re
+from tqdm import tqdm
+
+from cs336_basics.pretokenization_example import find_chunk_boundaries
 
 
 GPT2_PRETOKENIZE_PATTERN = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+# Boundary marker used to split the corpus into independent chunks for parallel pretokenization.
+# Must be a bytes literal present in the corpus; <|endoftext|> naturally separates documents in TinyStories / OWT.
+_CHUNK_SPLIT_TOKEN = b"<|endoftext|>"
 
 
 def _bytes_to_unicode() -> dict[int, str]:
@@ -195,22 +204,44 @@ def train_bpe(
     input_path: str | PathLike[str],
     vocab_size: int,
     special_tokens: list[str],
+    num_processes: int | None = None,
+    show_progress: bool = True,
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     vocab = _initial_vocab(special_tokens)
     if vocab_size <= len(vocab):
         return {token_id: vocab[token_id] for token_id in range(vocab_size)}, []
 
-    pretoken_counts = _count_pretokens(input_path, special_tokens)
+    # Stage 1: pretokenize the corpus (parallel, dominates I/O + regex cost).
+    pretoken_counts = _count_pretokens(
+        input_path, special_tokens, num_processes=num_processes, show_progress=show_progress
+    )
+
+    # Stage 2: build word table and initial pair statistics.
     words = {word_id: pretoken for word_id, pretoken in enumerate(pretoken_counts)}
     word_counts = {word_id: count for word_id, count in enumerate(pretoken_counts.values())}
+    if show_progress:
+        print(f"[bpe] unique pretokens: {len(words):,}")
     pair_counts, pair_to_word_ids = _initialize_pair_statistics(words, word_counts)
     merges: list[tuple[bytes, bytes]] = []
 
+    # Stage 3: iteratively merge the most frequent pair until reaching target vocab size.
+    num_merges_target = vocab_size - len(vocab)
+    pbar = tqdm(
+        total=num_merges_target,
+        desc="[bpe] merging",
+        unit="merge",
+        disable=not show_progress,
+        dynamic_ncols=True,
+    )
     while len(vocab) < vocab_size:
         if not pair_counts:
             break
 
+        # Tie-break with the lexicographically greater pair (per handout spec).
         best_pair = max(pair_counts, key=lambda pair: (pair_counts[pair], pair))
+        best_count = pair_counts[best_pair]
+
+        # Only words that actually contain best_pair need updating.
         affected_word_ids = list(pair_to_word_ids[best_pair])
         for word_id in affected_word_ids:
             old_word = words[word_id]
@@ -223,6 +254,13 @@ def train_bpe(
 
         merges.append(best_pair)
         vocab[len(vocab)] = best_pair[0] + best_pair[1]
+
+        # Live status: show the token we just added + its frequency.
+        if show_progress:
+            preview = (best_pair[0] + best_pair[1]).decode("utf-8", errors="replace")
+            pbar.set_postfix_str(f"vocab={len(vocab)} freq={best_count} token={preview!r}")
+            pbar.update(1)
+    pbar.close()
 
     return vocab, merges
 
@@ -245,18 +283,68 @@ def _initial_vocab(special_tokens: list[str]) -> dict[int, bytes]:
 def _count_pretokens(
     input_path: str | PathLike[str],
     special_tokens: list[str],
+    num_processes: int | None = None,
+    show_progress: bool = True,
 ) -> dict[tuple[bytes, ...], int]:
+    """Parallel pretokenize: split the file into byte chunks on <|endoftext|>,
+    run the GPT-2 regex over each chunk in a worker process, then merge the counters.
+    """
+    path = Path(input_path)
+    workers = num_processes or max(1, (os.cpu_count() or 1))
+
+    # Split file on the document-separator token so no pretoken straddles a chunk boundary.
+    with path.open("rb") as f:
+        boundaries = find_chunk_boundaries(f, workers * 4, _CHUNK_SPLIT_TOKEN)
+    chunk_ranges = list(zip(boundaries[:-1], boundaries[1:], strict=False))
+    if show_progress:
+        total_mb = path.stat().st_size / (1024 * 1024)
+        print(f"[bpe] pretokenizing {path.name} ({total_mb:.1f} MB) with {workers} workers, {len(chunk_ranges)} chunks")
+
+    # Fallback to single-process for tiny inputs or when the user asks for it.
+    if workers == 1 or len(chunk_ranges) <= 1:
+        merged: Counter[tuple[bytes, ...]] = Counter()
+        iterator = tqdm(chunk_ranges, desc="[bpe] pretok", unit="chunk", disable=not show_progress)
+        for start, end in iterator:
+            merged.update(_pretokenize_chunk((str(path), start, end, special_tokens)))
+        return dict(merged)
+
+    # Pool of workers; each reads its own byte range, so we don't pickle the raw text.
+    args = [(str(path), start, end, special_tokens) for start, end in chunk_ranges]
+    merged = Counter()
+    with mp.get_context("spawn").Pool(processes=workers) as pool:
+        for partial in tqdm(
+            pool.imap_unordered(_pretokenize_chunk, args),
+            total=len(args),
+            desc="[bpe] pretok",
+            unit="chunk",
+            disable=not show_progress,
+            dynamic_ncols=True,
+        ):
+            merged.update(partial)
+
+    return dict(merged)
+
+
+def _pretokenize_chunk(
+    args: tuple[str, int, int, list[str]],
+) -> Counter[tuple[bytes, ...]]:
+    """Worker: read [start, end) of the file and return pretoken counts for that slice."""
+    path, start, end, special_tokens = args
     pretokenizer = re.compile(GPT2_PRETOKENIZE_PATTERN)
-    text = Path(input_path).read_text(encoding="utf-8")
-    pretoken_counts: Counter[tuple[bytes, ...]] = Counter()
+    counts: Counter[tuple[bytes, ...]] = Counter()
+
+    with open(path, "rb") as f:
+        f.seek(start)
+        raw = f.read(end - start)
+    # errors='ignore' guards against a rare split that lands mid-multibyte-char.
+    text = raw.decode("utf-8", errors="ignore")
 
     for segment in _split_on_special_tokens(text, special_tokens):
         for match in pretokenizer.finditer(segment):
             token_bytes = match.group(0).encode("utf-8")
             if token_bytes:
-                pretoken_counts[tuple(bytes([byte]) for byte in token_bytes)] += 1
-
-    return dict(pretoken_counts)
+                counts[tuple(bytes([b]) for b in token_bytes)] += 1
+    return counts
 
 
 def _split_on_special_tokens(text: str, special_tokens: list[str]) -> list[str]:
