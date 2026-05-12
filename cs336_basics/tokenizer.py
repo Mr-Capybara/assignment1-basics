@@ -24,11 +24,7 @@ _CHUNK_SPLIT_TOKEN = b"<|endoftext|>"
 
 def _bytes_to_unicode() -> dict[int, str]:
     """GPT-2 reversible byte-to-unicode display mapping for serialized vocab files."""
-    bs = (
-        list(range(ord("!"), ord("~") + 1))
-        + list(range(ord("¡"), ord("¬") + 1))
-        + list(range(ord("®"), ord("ÿ") + 1))
-    )
+    bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
     cs = bs[:]
     n = 0
     for b in range(2**8):
@@ -74,13 +70,19 @@ class Tokenizer:
         with open(vocab_filepath, encoding="utf-8") as vocab_file:
             serialized_vocab = json.load(vocab_file)
 
-        if all(isinstance(value, int) for value in serialized_vocab.values()):
+        is_gpt2_vocab = all(isinstance(value, int) for value in serialized_vocab.values())
+        if is_gpt2_vocab:
+            # GPT-2 风格：{"token_string": token_id}，token_string 使用可逆 byte-to-unicode 映射。
             vocab = {
-                token_id: bytes(byte_decoder[char] for char in token)
-                for token, token_id in serialized_vocab.items()
+                token_id: bytes(byte_decoder[char] for char in token) for token, token_id in serialized_vocab.items()
             }
         else:
-            vocab = {int(token_id): bytes(token_bytes) for token_id, token_bytes in serialized_vocab.items()}
+            # 本仓库的 BPE 脚本保存为 {"token_id": "latin-1 字符串"}，也兼容
+            # {"token_id": [byte0, byte1, ...]} 这种 JSON bytes-list 表示。
+            vocab = {
+                int(token_id): token_bytes.encode("latin-1") if isinstance(token_bytes, str) else bytes(token_bytes)
+                for token_id, token_bytes in serialized_vocab.items()
+            }
 
         merges: list[tuple[bytes, bytes]] = []
         with open(merges_filepath, encoding="utf-8") as merges_file:
@@ -89,12 +91,15 @@ class Tokenizer:
                 if len(parts) != 2:
                     continue
                 left, right = parts
-                merges.append(
-                    (
-                        bytes(byte_decoder[char] for char in left),
-                        bytes(byte_decoder[char] for char in right),
+                if is_gpt2_vocab:
+                    merges.append(
+                        (
+                            bytes(byte_decoder[char] for char in left),
+                            bytes(byte_decoder[char] for char in right),
+                        )
                     )
-                )
+                else:
+                    merges.append((left.encode("latin-1"), right.encode("latin-1")))
 
         return cls(vocab, merges, special_tokens)
 
