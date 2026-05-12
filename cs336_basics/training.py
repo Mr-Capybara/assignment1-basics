@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Iterable
-from typing import Any
+from typing import IO, Any, BinaryIO
 
+import numpy as np
+import numpy.typing as npt
 import torch
 
 
@@ -138,3 +141,182 @@ def get_lr_cosine_schedule(
         return min_learning_rate + cosine_weight * (max_learning_rate - min_learning_rate)
 
     return min_learning_rate
+
+
+def get_batch(
+    dataset: npt.NDArray,
+    batch_size: int,
+    context_length: int,
+    device: str | torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """从一维 token ID 数组中随机采样语言模型训练 batch。
+
+    每个样本使用 dataset[start : start + context_length] 作为输入，
+    使用向右平移一位的 dataset[start + 1 : start + context_length + 1] 作为标签。
+    dataset 可以是普通 numpy array，也可以是 np.memmap。
+    """
+    if dataset.ndim != 1:
+        raise ValueError("dataset must be a 1D array of token IDs.")
+    if len(dataset) <= context_length:
+        raise ValueError("dataset must contain at least context_length + 1 tokens.")
+
+    max_start = len(dataset) - context_length
+    starts = np.random.randint(0, max_start, size=batch_size)
+    offsets = np.arange(context_length)
+
+    # 高级索引一次性取出所有窗口；对 memmap 也只会读取实际访问的片段。
+    input_batch = dataset[starts[:, None] + offsets[None, :]]
+    target_batch = dataset[starts[:, None] + offsets[None, :] + 1]
+
+    x = torch.as_tensor(input_batch, dtype=torch.long, device=device)
+    y = torch.as_tensor(target_batch, dtype=torch.long, device=device)
+    return x, y
+
+
+def save_checkpoint(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    iteration: int,
+    out: str | os.PathLike | BinaryIO | IO[bytes],
+) -> None:
+    """保存恢复训练所需的最小状态：模型、优化器和迭代步数。"""
+    checkpoint = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "iteration": iteration,
+    }
+    torch.save(checkpoint, out)
+
+
+def load_checkpoint(
+    src: str | os.PathLike | BinaryIO | IO[bytes],
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> int:
+    """加载 checkpoint，并把模型和优化器恢复到保存时的状态。"""
+    checkpoint = torch.load(src, map_location="cpu")
+    model.load_state_dict(checkpoint["model"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    return int(checkpoint["iteration"])
+
+
+def sample_next_token(
+    logits: torch.Tensor,
+    temperature: float = 1.0,
+    top_p: float | None = None,
+    generator: torch.Generator | None = None,
+) -> int:
+    """从单步 logits 中采样一个 token，支持 temperature 和 top-p。
+
+    logits 必须是一维张量，形状为 (vocab_size,)。
+    temperature 越小，分布越尖锐；temperature=0 时退化为 greedy argmax。
+    """
+    if logits.ndim != 1:
+        raise ValueError("logits must be a 1D tensor of shape (vocab_size,).")
+    if temperature < 0:
+        raise ValueError("temperature must be non-negative.")
+    if top_p is not None and not 0 < top_p <= 1:
+        raise ValueError("top_p must be in (0, 1].")
+
+    if temperature == 0:
+        return int(torch.argmax(logits).item())
+
+    probs = torch.softmax(logits / temperature, dim=-1)
+    if top_p is not None and top_p < 1:
+        sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+        # 取达到 top_p 阈值所需的最小 token 集合，并保留越过阈值的第一个 token。
+        cutoff = int(torch.searchsorted(cumulative_probs, torch.tensor(top_p, device=logits.device)).item())
+        cutoff = min(cutoff, sorted_probs.shape[0] - 1)
+        keep = torch.arange(sorted_probs.shape[0], device=logits.device) <= cutoff
+        probs_to_sample = sorted_probs[keep]
+        probs_to_sample = probs_to_sample / probs_to_sample.sum()
+        sampled_position = torch.multinomial(probs_to_sample, num_samples=1, generator=generator)
+        return int(sorted_indices[keep][sampled_position].item())
+
+    sampled_token = torch.multinomial(probs, num_samples=1, generator=generator)
+    return int(sampled_token.item())
+
+
+@torch.no_grad()
+def generate_token_ids(
+    model: torch.nn.Module,
+    prompt_token_ids: list[int] | torch.Tensor,
+    max_new_tokens: int,
+    context_length: int | None = None,
+    end_token_id: int | None = None,
+    temperature: float = 1.0,
+    top_p: float | None = None,
+    device: str | torch.device | None = None,
+    generator: torch.Generator | None = None,
+) -> list[int]:
+    """基于 prompt token IDs 自回归生成 token IDs。
+
+    如果生成长度超过模型 context_length，只保留最近的 context_length 个 token
+    作为下一步输入；返回值包含原始 prompt 和新生成的 token。
+    """
+    if max_new_tokens < 0:
+        raise ValueError("max_new_tokens must be non-negative.")
+
+    was_training = model.training
+    model.eval()
+    model_device = device if device is not None else next(model.parameters()).device
+
+    if isinstance(prompt_token_ids, torch.Tensor):
+        generated = prompt_token_ids.detach().to(dtype=torch.long, device=model_device).flatten().tolist()
+    else:
+        generated = list(prompt_token_ids)
+
+    if not generated:
+        raise ValueError("prompt_token_ids must contain at least one token.")
+
+    for _ in range(max_new_tokens):
+        context = generated[-context_length:] if context_length is not None else generated
+        input_ids = torch.tensor(context, dtype=torch.long, device=model_device).unsqueeze(0)
+        logits = model(input_ids)[0, -1]
+        next_token = sample_next_token(
+            logits,
+            temperature=temperature,
+            top_p=top_p,
+            generator=generator,
+        )
+        generated.append(next_token)
+        if end_token_id is not None and next_token == end_token_id:
+            break
+
+    if was_training:
+        model.train()
+    return generated
+
+
+def generate_text(
+    model: torch.nn.Module,
+    tokenizer: Any,
+    prompt: str,
+    max_new_tokens: int,
+    context_length: int | None = None,
+    end_token: str = "<|endoftext|>",
+    temperature: float = 1.0,
+    top_p: float | None = None,
+    device: str | torch.device | None = None,
+    generator: torch.Generator | None = None,
+) -> str:
+    """对文本 prompt 做 encode -> generate -> decode 的便捷封装。"""
+    prompt_token_ids = tokenizer.encode(prompt)
+    end_token_id = None
+    if end_token is not None and hasattr(tokenizer, "token_to_id"):
+        end_token_id = tokenizer.token_to_id.get(end_token.encode("utf-8"))
+
+    output_ids = generate_token_ids(
+        model=model,
+        prompt_token_ids=prompt_token_ids,
+        max_new_tokens=max_new_tokens,
+        context_length=context_length,
+        end_token_id=end_token_id,
+        temperature=temperature,
+        top_p=top_p,
+        device=device,
+        generator=generator,
+    )
+    return tokenizer.decode(output_ids)
